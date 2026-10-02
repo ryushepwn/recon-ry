@@ -23,43 +23,48 @@ MAJOR="$(printf '%s' "${RAW_VER#v}" | cut -d. -f1)"
 : "${MAJOR:=0}"
 echo "[amass] version=${RAW_VER:-unknown} major=$MAJOR rate=${RATE}qps" >&2
 
+# Resolver discovery. amass ships its own DNS stack and does NOT use the OS
+# resolver, so on hosts where outbound DNS is restricted (e.g. a VPN that
+# permits only its own in-tunnel resolver) amass cannot resolve its bootstrap
+# hosts and the v5 engine dies at startup. Passing working resolvers via -r
+# fixes that. Config is not trusted - every candidate is probed, because this
+# host advertises 1.1.1.1/8.8.8.8 via resolvectl while both are firewalled.
+discover_resolvers() {
+  local cands="" r working=""
+  command -v resolvectl >/dev/null 2>&1 &&     cands+=" $(resolvectl status 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ')"
+  cands+=" $(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+  for ip in $(ip -o -4 addr show 2>/dev/null | grep -E 'wg|tun' | awk '{print $4}' | cut -d/ -f1); do
+    cands+=" ${ip%.*}.1"
+  done
+  cands+=" 10.64.0.1 1.1.1.1 8.8.8.8"
+  for r in $(printf '%s\n' $cands | awk 'NF' | sort -u); do
+    if timeout 4 dig +short +time=2 +tries=1 "@$r" A one.one.one.one 2>/dev/null | grep -qE '^[0-9]+\.'; then
+      working+="${working:+,}$r"
+    fi
+  done
+  printf '%s' "$working"
+}
+RESOLVERS="${AMASS_RESOLVERS:-$(discover_resolvers)}"
+RFLAG=()
+if [ -n "$RESOLVERS" ]; then
+  RFLAG=(-r "$RESOLVERS")
+  echo "[amass] resolvers (probed): $RESOLVERS" >&2
+else
+  echo "[amass] WARNING: no working resolver found; amass will use its built-in list" >&2
+fi
+
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/all"
 roots=0; ok=0
 
-ensure_engine_v5() {
-  pgrep -f '[a]mass engine' >/dev/null 2>&1 && return 0
-  echo "[amass] v5 detected; starting local engine" >&2
-  nohup amass engine -log-dir "$tmp/enginelog" >"$tmp/engine.out" 2>&1 &
-  local w=0
-  while [ "$w" -lt "$ENGINE_WAIT" ]; do
-    pgrep -f '[a]mass engine' >/dev/null 2>&1 && { echo "[amass] engine up" >&2; return 0; }
-    grep -qiE 'failed to start the engine' "$tmp/engine.out" 2>/dev/null && {
-      echo "[amass] ENGINE FAILED: $(tr -d '\n' < "$tmp/engine.out" | cut -c1-160)" >&2
-      return 1
-    }
-    sleep 2; w=$((w+2))
-  done
-  echo "[amass] ENGINE TIMEOUT after ${ENGINE_WAIT}s" >&2
-  return 1
-}
-
-if [ "$MAJOR" -ge 5 ]; then
-  if ! ensure_engine_v5; then
-    cat >&2 <<'MSG'
-[amass] FATAL: amass v5 requires a reachable engine, and it could not start.
-[amass]   v5 resolves its own bootstrap hosts (e.g. bgp.tools) through its own
-[amass]   DNS stack aimed at public resolvers. If outbound DNS to public
-[amass]   resolvers is firewalled, the engine exits at startup and `amass enum`
-[amass]   would otherwise hang forever with no output.
-[amass]   v5 exposes no resolver flag/config (checked config.yaml,
-[amass]   datasources.yaml, -r/-rf, AMASS_* env), so there is no in-tool fix.
-[amass]   Options: allow outbound DNS to a public resolver, point AMASS_ENGINE_HOST
-[amass]   at a working remote engine, or pin amass v4 (one-shot, no engine).
-MSG
-    : > "$OUT"; exit 1
-  fi
-fi
+# NOTE: deliberately no standalone-engine pre-start here.
+# `amass engine` rejects -r/-rf ("flag provided but not defined"), so a
+# standalone engine cannot be given working resolvers and dies at startup on a
+# DNS-restricted host. `amass enum -r` spawns its OWN engine and passes the
+# resolvers through to it, which is the only path that clears DNS bootstrap.
+# Verified: with -r the engine starts 14 plugins and no longer fails on
+# BGPTools; it may still exceed enum's fixed ~60s readiness wait, which the
+# per-root handler below reports explicitly.
 
 while IFS= read -r root; do
   root="${root%%[[:space:]]*}"; [ -z "$root" ] && continue
@@ -68,11 +73,11 @@ while IFS= read -r root; do
   roots=$((roots+1))
 
   if [ "$MAJOR" -ge 5 ]; then
-    timeout "$HARD_TIMEOUT" amass enum -d "$root" -silent -nocolor >/dev/null 2>"$tmp/$root.err"
+    timeout "$HARD_TIMEOUT" amass enum -d "$root" "${RFLAG[@]}" -silent -nocolor >/dev/null 2>"$tmp/$root.err"
     rc=$?
     timeout 120 amass subs -d "$root" -names -silent -nocolor 2>/dev/null >"$tmp/$root.out" || true
   else
-    timeout "$HARD_TIMEOUT" amass enum -passive -d "$root" -rqps "$RATE" -silent -nocolor \
+    timeout "$HARD_TIMEOUT" amass enum -passive -d "$root" "${RFLAG[@]}" -rqps "$RATE" -silent -nocolor \
       >"$tmp/$root.out" 2>"$tmp/$root.err"
     rc=$?
   fi
@@ -81,6 +86,9 @@ while IFS= read -r root; do
   # here would append a SECOND zero and break the integer tests below.
   n=$(grep -coE '^[A-Za-z0-9_.-]+\.[A-Za-z]{2,}$' "$tmp/$root.out" 2>/dev/null | head -1)
   n=${n:-0}
+  if grep -qi 'engine did not respond' "$tmp/$root.err" 2>/dev/null; then
+    echo "[amass] $root: v5 engine never became responsive (enum has a fixed ~60s internal wait)." >&2
+  fi
   if [ "$rc" -eq 124 ]; then
     echo "[amass] $root: hit ${HARD_TIMEOUT}s ceiling; keeping $n partial names" >&2
   elif [ "$rc" -ne 0 ]; then
